@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
@@ -9,7 +10,7 @@ function sendPublicFile(response, fileName) {
 }
 
 function createSessionId() {
-  return `SESSION-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+  return crypto.randomBytes(32).toString("hex");
 }
 
 async function createApp() {
@@ -65,15 +66,17 @@ async function createApp() {
     next();
   });
 
-  function requireAuth(request, response, next) {
-    if (!request.currentUser) {
-      response.status(401).json({ error: "Authentication required." });
+ function requireCsrf(request, response, next) {
+    const cookieToken = request.cookies.csrf_token;
+    const headerToken = request.headers["x-csrf-token"];
+
+    if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+      response.status(403).json({ error: "Invalid CSRF token." });
       return;
     }
 
     next();
   }
-
   app.get("/", (_request, response) => sendPublicFile(response, "index.html"));
   app.get("/login", (_request, response) => sendPublicFile(response, "login.html"));
   app.get("/notes", (_request, response) => sendPublicFile(response, "notes.html"));
@@ -81,26 +84,35 @@ async function createApp() {
   app.get("/admin", (_request, response) => sendPublicFile(response, "admin.html"));
 
   app.get("/api/me", (request, response) => {
+    const csrfToken = crypto.randomBytes(32).toString("hex");
+    request.currentUser && (request.currentUser.csrfToken = csrfToken);
+
+    response.cookie("csrf_token", csrfToken, {
+      path: "/",
+      httpOnly: false,
+      sameSite: "Strict"
+    });
+
     response.json({ user: request.currentUser });
   });
 
-  app.post("/api/login", async (request, response) => {
+  app.post("/api/login", requireCsrf, async (request, response) => {
     const username = String(request.body.username || "");
     const password = String(request.body.password || "");
 
-    const query = `
-      SELECT id, username, role, display_name
-      FROM users
-      WHERE username = '${username}' AND password = '${password}'
-    `;
-    const user = await db.get(query);
+    const user = await db.get(
+      `SELECT id, username, role, display_name
+       FROM users
+       WHERE username = ? AND password = ?`,
+      [username, password]
+    );
 
     if (!user) {
       response.status(401).json({ error: "Invalid username or password." });
       return;
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
+    const sessionId = createSessionId();
 
     await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
     await db.run(
@@ -109,7 +121,9 @@ async function createApp() {
     );
 
     response.cookie("sid", sessionId, {
-      path: "/"
+      path: "/",
+      httpOnly: true,
+      sameSite: "Strict"
     });
 
     response.json({
@@ -123,7 +137,7 @@ async function createApp() {
     });
   });
 
-  app.post("/api/logout", async (request, response) => {
+  app.post("/api/logout", requireCsrf, async (request, response) => {
     if (request.cookies.sid) {
       await db.run("DELETE FROM sessions WHERE id = ?", [request.cookies.sid]);
     }
@@ -132,12 +146,12 @@ async function createApp() {
     response.json({ ok: true });
   });
 
-  app.get("/api/notes", requireAuth, async (request, response) => {
+  app.post("/api/notes", requireAuth, requireCsrf, async (request, response) => {
     const ownerId = request.query.ownerId || request.currentUser.id;
     const search = request.query.search || "";
 
-    const notes = await db.all(`
-      SELECT
+  const notes = await db.all(
+      `SELECT
         notes.id,
         notes.owner_id AS ownerId,
         users.username AS ownerUsername,
@@ -147,16 +161,17 @@ async function createApp() {
         notes.created_at AS createdAt
       FROM notes
       JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
-      ORDER BY notes.pinned DESC, notes.id DESC
-    `);
+      WHERE notes.owner_id = ?
+        AND (notes.title LIKE ? OR notes.body LIKE ?)
+      ORDER BY notes.pinned DESC, notes.id DESC`,
+      [ownerId, `%${search}%`, `%${search}%`]
+    );
 
     response.json({ notes });
   });
 
   app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
+    const ownerId = request.currentUser.id;
     const title = String(request.body.title || "");
     const body = String(request.body.body || "");
     const pinned = request.body.pinned ? 1 : 0;
@@ -172,7 +187,7 @@ async function createApp() {
     });
   });
 
-  app.get("/api/settings", requireAuth, async (request, response) => {
+  app.post("/api/settings", requireAuth, requireCsrf, async (request, response) => {
     const userId = Number(request.query.userId || request.currentUser.id);
 
     const settings = await db.get(
@@ -211,8 +226,8 @@ async function createApp() {
     response.json({ ok: true });
   });
 
-  app.get("/api/settings/toggle-email", requireAuth, async (request, response) => {
-    const enabled = request.query.enabled === "1" ? 1 : 0;
+  app.post("/api/settings/toggle-email", requireAuth, requireCsrf, async (request, response) => {
+    const enabled = request.body.enabled ? 1 : 0;
 
     await db.run("UPDATE settings SET email_opt_in = ? WHERE user_id = ?", [
       enabled,
@@ -226,7 +241,11 @@ async function createApp() {
     });
   });
 
-  app.get("/api/admin/users", requireAuth, async (_request, response) => {
+  app.get("/api/admin/users", requireAuth, async (request, response) => {
+    if (request.currentUser.role !== "admin") {
+      response.status(403).json({ error: "Admin access required." });
+      return;
+    }
     const users = await db.all(`
       SELECT
         users.id,
